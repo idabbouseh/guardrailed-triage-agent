@@ -8,10 +8,14 @@ The same discipline as a production integration client:
 - surface HTTP and transport errors as structured results instead of
   raising through the agent (tools should return data the model can
   reason about, never a stack trace).
+
+Every method returns the decoded JSON body on success, or an error dict
+{"error": True, "status_code": int | None, "detail": str} on failure.
 """
 
 import os
 import time
+from urllib.parse import quote
 
 import httpx
 
@@ -83,9 +87,50 @@ class HelpdeskClient:
             return resp.json()
         return {"error": True, "status_code": None, "detail": "retry exhausted"}
 
-    # -- api (endpoints added in Phase 1) ----------------------------------
+    @staticmethod
+    def _segment(value: str) -> str:
+        """Ids come from model output; quote them so a stray '/' or '?' cannot
+        change which route is hit."""
+        return quote(str(value), safe="")
+
+    # -- reads ------------------------------------------------------------
     def health(self) -> dict:
         return self._request("GET", "/api/v1/health")
+
+    def list_tickets(
+        self,
+        status: str | None = None,
+        contact_id: str | None = None,
+        q: str | None = None,
+    ) -> dict:
+        filters = {"status": status, "contact_id": contact_id, "q": q}
+        params = {key: value for key, value in filters.items() if value is not None}
+        return self._request("GET", "/api/v1/tickets", params=params)
+
+    def get_ticket(self, ticket_id: str) -> dict:
+        return self._request("GET", f"/api/v1/tickets/{self._segment(ticket_id)}")
+
+    def find_contacts(self, email: str | None = None) -> dict:
+        params = {"email": email} if email is not None else {}
+        return self._request("GET", "/api/v1/contacts", params=params)
+
+    def get_contact(self, contact_id: str) -> dict:
+        return self._request("GET", f"/api/v1/contacts/{self._segment(contact_id)}")
+
+    # -- writes (each one is gated by triage_agent/guard.py before it is called)
+    def create_reply(self, ticket_id: str, text: str) -> dict:
+        path = f"/api/v1/tickets/{self._segment(ticket_id)}/replies"
+        return self._request("POST", path, json={"text": text})
+
+    def create_task(self, payload: dict) -> dict:
+        return self._request("POST", "/api/v1/tasks", json=payload)
+
+    def create_credit(self, payload: dict) -> dict:
+        return self._request("POST", "/api/v1/credits", json=payload)
+
+    def escalate_ticket(self, ticket_id: str, payload: dict) -> dict:
+        path = f"/api/v1/tickets/{self._segment(ticket_id)}/escalate"
+        return self._request("POST", path, json=payload)
 
 
 _client: HelpdeskClient | None = None
