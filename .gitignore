@@ -5,4 +5,6 @@ __pycache__/
 .pytest_cache/
 .adk/
 audit/*.jsonl
+evals/audit-*.jsonl
+evals/latest-results.json
 HALT
