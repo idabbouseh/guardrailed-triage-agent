@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Packages live at the repo root (triage_agent/, mock_helpdesk/, evals/) and the
+# suite runs without installing the project, so pytest needs the root on
+# sys.path explicitly.
+pythonpath = ["."]
+testpaths = ["tests"]
