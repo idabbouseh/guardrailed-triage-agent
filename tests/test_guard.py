@@ -287,6 +287,43 @@ def test_reply_to_spam_ticket_is_refused():
     assert _phases() == ["refused_policy"]
 
 
+def test_reply_to_emergency_ticket_is_refused_whether_category_is_payload_or_context():
+    # Arrange
+    perform = Recorder()
+
+    # Act
+    in_payload = guard.guarded_write(
+        "draft_reply", {**REPLY, "category": "emergency"}, confirmed=False, perform=perform
+    )
+    as_context = guard.guarded_write("draft_reply", REPLY, False, perform, category="emergency")
+
+    # Assert
+    for result in (in_payload, as_context):
+        assert result["refused"] is True
+        assert "escalated to a human" in result["detail"]
+    assert perform.calls == []
+    assert _phases() == ["refused_policy", "refused_policy"]
+
+
+def test_redact_masks_card_like_numbers_in_nested_values_without_mutating_input():
+    # Arrange
+    original = {
+        "tickets": [{"body": f"charge {VISA_TEST_NUMBER} please", "tags": ("billing",)}],
+        "note": f"ref {NOT_A_CARD}",
+        "total": 1,
+    }
+
+    # Act
+    masked = guard.redact(original)
+
+    # Assert
+    assert masked["tickets"][0]["body"] == "charge **** please"
+    assert masked["note"] == original["note"]  # Luhn-invalid run left alone
+    assert masked["total"] == 1
+    assert VISA_TEST_NUMBER in original["tickets"][0]["body"]  # input untouched
+    assert "4111" not in json.dumps(masked)
+
+
 def test_category_argument_feeds_policy_without_changing_the_preview():
     # Arrange: category comes from the ticket record, not from the model
     perform = Recorder()

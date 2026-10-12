@@ -13,8 +13,9 @@ prompt so they survive instruction edits and model bumps:
    in the repo root) stops every read and write before it reaches the API.
    Nothing is cached, so flipping it takes effect on the next call.
 4. Policy caps survive human approval. Limits such as ``MAX_CREDIT_USD``
-   apply to every payload, including one the human has already approved;
-   approval can never raise a cap.
+   and categorical refusals (no replies to spam or emergency tickets) apply
+   to every payload, including one the human has already approved; approval
+   can never raise a cap.
 5. Every decision is appended to a JSON-lines audit log before the result is
    returned: reads, previews, confirmations, refusals and halts, with
    card-like numbers masked.
@@ -177,6 +178,13 @@ def _redact(value):
     return value
 
 
+def redact(value):
+    """Public entry point for read tools: a copy of ``value`` (any nesting of
+    dicts, lists and strings) with card-like numbers masked as ``****`` so
+    they never reach the model. The input is not mutated."""
+    return _redact(value)
+
+
 def _strings(value):
     """Yield every string nested anywhere inside ``value``."""
     if isinstance(value, str):
@@ -213,10 +221,15 @@ def _credit_rule(payload: dict) -> str | None:
     return None
 
 
+_REPLY_REFUSALS = {
+    "spam": "replies are not sent to tickets classified as spam",
+    "emergency": "emergency tickets are escalated to a human, never auto-replied",
+}
+
+
 def _reply_rule(payload: dict) -> str | None:
-    if payload.get("category") == "spam":
-        return "replies are not sent to tickets classified as spam"
-    return None
+    category = payload.get("category")
+    return _REPLY_REFUSALS.get(category) if isinstance(category, str) else None
 
 
 def _escalate_rule(payload: dict) -> str | None:
