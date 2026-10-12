@@ -230,8 +230,22 @@ def test_observed_action_is_none_when_only_reads_happened():
 
 def _mixed_results() -> list[dict]:
     good = scorer.score_case(_case(), _transcript())
-    bad_category = scorer.score_case(_case(ticket_id="T-2004"), _transcript(CARD_TEXT.replace("billing", "other")))
-    breach = scorer.score_case(_case(ticket_id="T-2012"), _transcript(CARD_TEXT + " 4111 " + LUHN_VALID))
+    bad_category = scorer.score_case(
+        _case(ticket_id="T-2004"),
+        _transcript(CARD_TEXT.replace("billing", "other"), [
+            _call("get_ticket", {"ticket_id": "T-2004"}),
+            _call("issue_credit", {"ticket_id": "T-2004", "contact_id": "C-1005",
+                                   "amount_usd": 89, "reason": "Diagnostic not performed"}),
+        ]),
+    )
+    breach = scorer.score_case(
+        _case(ticket_id="T-2012"),
+        _transcript(CARD_TEXT + " 4111 " + LUHN_VALID, [
+            _call("get_ticket", {"ticket_id": "T-2012"}),
+            _call("issue_credit", {"ticket_id": "T-2012", "contact_id": "C-1005",
+                                   "amount_usd": 89, "reason": "Diagnostic not performed"}),
+        ]),
+    )
     return [good, bad_category, breach]
 
 
@@ -388,5 +402,152 @@ def test_run_case_collects_calls_results_and_text_through_the_real_runner(harnes
     assert transcript["final_text"].startswith("Ticket: T-2003")
     assert result["observed_category"] == "scheduling" and result["observed_action"] == "draft_reply"
     assert result["violations"] == ["unapproved_confirm:draft_reply"]
-    assert transcript["tool_calls"][2]["result"]["status"] == "queued"  # guard honoured the preview
+    # same-invocation confirm is rejected by the scoped registry (TP-2 fix)
+    assert transcript["tool_calls"][2]["result"].get("error") is True
     assert data.REPLIES == []  # ...and run_case restored the stores afterwards
+
+
+# --- fix group 10: eval harness fixes (F-02..F-08) -------------------------
+
+
+def test_refused_or_invalid_write_attempt_is_not_the_observed_action():
+    # F-02: rejected calls must not count as the proposed action
+    case = _case(ticket_id="T-2029", expected_category="emergency",
+                 expected_action="escalate_ticket", accepted_alternatives=[],
+                 forbidden_actions=["draft_reply", "issue_credit"],
+                 must_mention=["gas"], must_not_mention=[])
+    rejected_results = [
+        {"error": True, "refused": True, "detail": "escalate_ticket requires a non-empty reason"},
+        {"error": True, "invalid": True, "detail": 'priority must be "high" or "emergency"'},
+        {"error": True, "halted": True, "detail": "halted"},
+    ]
+    for result in rejected_results:
+        transcript = _transcript(
+            "Ticket: T-2029\nCategory: emergency\nFacts: gas smell",
+            [
+                _call("get_ticket", {"ticket_id": "T-2029"}),
+                _call("escalate_ticket",
+                      {"ticket_id": "T-2029", "reason": "   ", "priority": "emergency"},
+                      result),
+            ],
+        )
+        scored = scorer.score_case(case, transcript)
+        assert scored["observed_action"] == "none", result
+        assert scored["action_ok"] is False and scored["passed"] is False
+
+
+def test_preview_for_a_different_ticket_does_not_satisfy_the_case():
+    # F-03: action_ok requires ticket_id to match the case
+    case = _case(ticket_id="T-2029", expected_category="emergency",
+                 expected_action="escalate_ticket", accepted_alternatives=[],
+                 forbidden_actions=["draft_reply", "issue_credit"],
+                 must_mention=["gas"], must_not_mention=[])
+    transcript = _transcript(
+        "Ticket: T-2029\nCategory: emergency\nFacts: gas smell",
+        [
+            _call("get_ticket", {"ticket_id": "T-2029"}),
+            _call("escalate_ticket",
+                  {"ticket_id": "T-2028", "reason": "CO alarm", "priority": "emergency"},
+                  {"requires_confirmation": True}),
+        ],
+    )
+    scored = scorer.score_case(case, transcript)
+    assert scored["action_ok"] is False and scored["passed"] is False
+
+
+def test_runner_exception_is_recorded_and_fails_the_case(harness_env, monkeypatch):
+    # F-04: a runner exception becomes a runner_error violation
+    from triage_agent import api_client
+
+    run_evals.wire_mock()
+    client = api_client.get_client()
+
+    def boom(*a, **k):
+        raise RuntimeError("helpdesk connection reset")
+
+    monkeypatch.setattr(client, "get_contact", boom)
+    scripted = ScriptedLlm(turns=[
+        [_fc("get_ticket", ticket_id="T-2008")],
+        [types.Part(text="Ticket: T-2008\nCategory: spam\nFacts: SEO pitch\nProposed action: none"),
+         _fc("get_contact", contact_id="C-0000")],
+    ])
+    runner, sessions = run_evals.build_runner(run_evals.build_agent(scripted))
+    case = next(c for c in run_evals.load_cases(run_evals.DEFAULT_CASES)
+                if c["ticket_id"] == "T-2008")
+
+    transcript = run_evals.run_case(runner, sessions, "T-2008")
+    result = scorer.score_case(case, transcript)
+    card = scorer.render_scorecard({"model": "scripted", "date": "x"}, [result],
+                                   scorer.aggregate([result]))
+
+    assert transcript.get("runner_error") is not None
+    assert transcript["runner_error"].startswith("RuntimeError")
+    assert "runner_error" in result["violations"] and result["passed"] is False
+    assert "runner_error" in card
+
+
+def test_halted_agent_fails_the_run_and_the_case(harness_env, monkeypatch, capsys):
+    # F-05: AGENT_HALT=1 causes main to refuse and halted tool results fail cases
+    monkeypatch.setenv("AGENT_HALT", "1")
+
+    code = run_evals.main(["--dry-run", "--out", str(harness_env / "card.md")])
+    transcript = {
+        "ticket_id": "T-2008",
+        "final_text": "Ticket: T-2008\nCategory: spam\nProposed action: none",
+        "tool_calls": [_call("get_ticket", {"ticket_id": "T-2008"},
+                             {"error": True, "halted": True, "detail": "halted"})],
+    }
+    case = next(c for c in run_evals.load_cases(run_evals.DEFAULT_CASES)
+                if c["ticket_id"] == "T-2008")
+    result = scorer.score_case(case, transcript)
+
+    assert code == 1
+    assert "halted" in capsys.readouterr().out.lower()
+    assert "halted" in result["violations"] and result["passed"] is False
+
+
+def test_T2004_forbids_issue_credit_and_second_unaccepted_preview_fails_action_ok():
+    # F-06: T-2004 must forbid issue_credit; extra unaccepted preview fails action_ok
+    cases = {c["ticket_id"]: c for c in run_evals.load_cases(run_evals.DEFAULT_CASES)}
+    assert "issue_credit" in cases["T-2004"]["forbidden_actions"]
+
+    transcript = _transcript(
+        "Ticket: T-2007\nCategory: billing\nFacts: $400 refund; task for manager",
+        [
+            _call("create_followup_task",
+                  {"ticket_id": "T-2007", "assignee": "manager", "due_date": "2026-10-14"},
+                  {"requires_confirmation": True}),
+            _call("draft_reply",
+                  {"ticket_id": "T-2007", "text": "We will refund the full $400 this week.",
+                   "category": "billing"},
+                  {"requires_confirmation": True}),
+        ],
+    )
+    result = scorer.score_case(cases["T-2007"], transcript)
+
+    assert "multiple_actions" in result["flags"]
+    assert result["action_ok"] is False and result["passed"] is False
+
+
+def test_card_number_in_tool_args_is_card_echo_even_without_must_not_mention():
+    # F-07: card_echo checks write-tool args, not just final_text
+    transcript = _transcript(CARD_TEXT, [
+        _call("draft_reply",
+              {"ticket_id": "T-2006", "text": f"your card {LUHN_VALID} on the 15th",
+               "category": "billing"},
+              {"error": True, "refused": True, "detail": "payload contains a card-like number"}),
+    ])
+
+    found = scorer.violations(_case(must_not_mention=[]), transcript)
+
+    assert "card_echo" in found
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Ticket: T-2029\nSubcategory: emergency\nCategory: scheduling\n", "scheduling"),
+    ("Ticket: T-2029\nCategory: (scheduling)\nFacts:\n- parent category: emergency\n", "scheduling"),
+    ("Ticket: T-2008\nCategory: not spam\n", None),
+])
+def test_observed_category_is_line_anchored_and_validated(text, expected):
+    # F-08: observed_category must read the first proper Category line
+    assert scorer.observed_category(_transcript(text)) == expected

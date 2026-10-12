@@ -14,7 +14,13 @@ audit). Nothing here reaches the API except through those two gates.
 import re
 from datetime import date, datetime
 
+from google.adk.tools.tool_context import ToolContext
+
 from triage_agent import api_client, guard
+
+# Valid id: starts with a letter or digit, then letters/digits/underscore/dash
+_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 CATEGORIES = frozenset(
     {"scheduling", "billing", "complaint", "warranty", "cancellation",
@@ -26,10 +32,14 @@ DUPLICATE_WINDOW_HOURS = 24
 # Life-safety signals. A ticket matching any of these is an emergency no
 # matter how the model classified it; over-matching is the safe direction.
 _EMERGENCY_PATTERNS = re.compile(
-    r"\bgas\b.{0,20}\b(smell|leak|odou?r)|\b(smell|leak|odou?r)\b.{0,20}\bgas\b"
-    r"|carbon monoxide|\bco\b.{0,15}\b(alarm|detector)"
+    r"\b(gas|propane)\b.{0,60}\b(smell\w*|leak\w*|odou?r\w*|fumes?)\b"
+    r"|\b(smell\w*|leak\w*|odou?r\w*|fumes?)\b.{0,60}\b(gas|propane)\b"
+    r"|carbon[\s-]*monoxide|\bco2?\b.{0,15}\b(alarm|detector)"
     r"|\bsmok(e|ing)\b|\bfire\b|\bspark(s|ing|ed)?\b"
-    r"|electrical.{0,20}burn|burning.{0,10}(smell|odou?r)|smells?.{0,20}burning",
+    r"|electrical.{0,20}burn|burning.{0,10}(smell|odou?r)|smells?.{0,20}burning"
+    r"|\b(olor|huele|fuga|escape)\b.{0,40}\bgas\b"
+    r"|\bgas\b.{0,40}\b(olor|huele|fuga|escape)\b"
+    r"|mon[oó]xido|\bhumo\b|\b(fuego|incendio)\b|\bchispa\w*",
     re.IGNORECASE | re.DOTALL,
 )
 _WHITESPACE = re.compile(r"\s+")
@@ -41,6 +51,11 @@ _WHITESPACE = re.compile(r"\s+")
 def _invalid(detail: str) -> dict:
     """Structured argument error, returned before the guard is consulted."""
     return {"error": True, "invalid": True, "detail": detail}
+
+
+def _valid_id(value) -> bool:
+    """True when value is a non-empty string that looks like a ticket or contact id."""
+    return isinstance(value, str) and _ID_PATTERN.fullmatch(value) is not None
 
 
 def _client() -> api_client.HelpdeskClient:
@@ -96,6 +111,31 @@ def _emergency_override(ticket: dict, category: str) -> str:
     return "emergency" if _EMERGENCY_PATTERNS.search(text) else category
 
 
+def _spam_override(ticket: dict, category: str) -> str:
+    """Code-side override: a ticket with no contact_id whose requester email
+    has no CRM record is treated as spam regardless of the model's label."""
+    if category == "spam" or ticket.get("contact_id"):
+        return category
+    email = ticket.get("requester_email") or ""
+    if not email:
+        return "spam"
+    found = get_contact(email=email)  # guarded: audited, halt-aware
+    no_record = found.get("error") and found.get("status_code") == 404
+    return "spam" if no_record else category
+
+
+def _ctx(tool_context: ToolContext | None) -> dict:
+    """Conversation identity injected by ADK (hidden from the model schema);
+    empty for direct calls so tests and scripts keep working unchanged."""
+    if tool_context is None:
+        return {}
+    session = tool_context.session
+    return {
+        "scope": f"{session.app_name}/{session.user_id}/{session.id}",
+        "invocation_id": tool_context.invocation_id,
+    }
+
+
 # -- read tools -------------------------------------------------------------
 
 
@@ -132,6 +172,9 @@ def get_ticket(ticket_id: str) -> dict:
         The ticket dict with card-like numbers masked as "****", or
         {"error": True, "status_code": 404, "detail": str} if it does not exist.
     """
+    if not _valid_id(ticket_id):
+        return _invalid('ticket_id must look like "T-2003"')
+
     def perform(params: dict) -> dict:
         return guard.redact(_client().get_ticket(params["ticket_id"]))
 
@@ -154,6 +197,8 @@ def get_contact(contact_id: str = "", email: str = "") -> dict:
     """
     if not contact_id and not email:
         return _invalid("get_contact needs a contact_id or an email")
+    if contact_id and not _valid_id(contact_id):
+        return _invalid('contact_id must look like "C-1001"')
 
     def perform(params: dict) -> dict:
         if params["contact_id"]:
@@ -185,6 +230,9 @@ def find_duplicates(ticket_id: str) -> dict:
         "created_at", "match"}, ...], "total": int}, where "match" is "body"
         or "subject+24h". An error dict if the ticket cannot be fetched.
     """
+    if not _valid_id(ticket_id):
+        return _invalid('ticket_id must look like "T-2025"')
+
     def perform(params: dict) -> dict:
         ticket = _client().get_ticket(params["ticket_id"])
         if ticket.get("error"):
@@ -206,7 +254,13 @@ def find_duplicates(ticket_id: str) -> dict:
 # -- write tools ------------------------------------------------------------
 
 
-def draft_reply(ticket_id: str, text: str, category: str, confirmed: bool = False) -> dict:
+def draft_reply(
+    ticket_id: str,
+    text: str,
+    category: str,
+    confirmed: bool = False,
+    tool_context: ToolContext | None = None,
+) -> dict:
     """Queue a reply to the customer on a ticket. Write it in the customer's
     language and never include card or bank numbers.
 
@@ -231,6 +285,8 @@ def draft_reply(ticket_id: str, text: str, category: str, confirmed: bool = Fals
         A preview dict, the created reply {"reply_id", "status": "queued", ...},
         or a structured refusal/error dict with "detail".
     """
+    if not isinstance(confirmed, bool):
+        return _invalid("confirmed must be a boolean")
     if category not in CATEGORIES:
         return _invalid(f"category must be one of {sorted(CATEGORIES)}")
     if not text.strip():
@@ -238,17 +294,23 @@ def draft_reply(ticket_id: str, text: str, category: str, confirmed: bool = Fals
     ticket = get_ticket(ticket_id)  # guarded: halts and 404s surface here
     if ticket.get("error"):
         return ticket
-    effective = _emergency_override(ticket, category)
+    effective = _emergency_override(ticket, _spam_override(ticket, category))
     payload = {"ticket_id": ticket_id, "text": text}
 
     def perform(p: dict) -> dict:
         return _client().create_reply(p["ticket_id"], p["text"])
 
-    return guard.guarded_write("draft_reply", payload, confirmed, perform, category=effective)
+    return guard.guarded_write("draft_reply", payload, confirmed, perform,
+                               category=effective, **_ctx(tool_context))
 
 
 def create_followup_task(
-    ticket_id: str, assignee: str, due_date: str, note: str = "", confirmed: bool = False
+    ticket_id: str,
+    assignee: str,
+    due_date: str,
+    note: str = "",
+    confirmed: bool = False,
+    tool_context: ToolContext | None = None,
 ) -> dict:
     """Create an internal follow-up task on a ticket for a person or queue
     (for example "dispatch", "billing", "manager"). Use it when the right
@@ -271,20 +333,32 @@ def create_followup_task(
         A preview dict, the created task {"task_id", "status": "open", ...},
         or a structured error dict with "detail".
     """
+    if not isinstance(confirmed, bool):
+        return _invalid("confirmed must be a boolean")
     if not assignee.strip():
         return _invalid("assignee must not be blank")
     try:
+        if not _ISO_DATE.fullmatch(due_date):
+            raise ValueError(due_date)
         date.fromisoformat(due_date)
     except (TypeError, ValueError):
         return _invalid("due_date must be an ISO date (YYYY-MM-DD)")
-    payload = {"ticket_id": ticket_id, "assignee": assignee, "due_date": due_date, "note": note}
+    payload = {
+        "ticket_id": ticket_id, "assignee": assignee, "due_date": due_date, "note": note
+    }
     return guard.guarded_write(
-        "create_followup_task", payload, confirmed, lambda p: _client().create_task(p)
+        "create_followup_task", payload, confirmed, lambda p: _client().create_task(p),
+        **_ctx(tool_context),
     )
 
 
 def issue_credit(
-    ticket_id: str, contact_id: str, amount_usd: float, reason: str, confirmed: bool = False
+    ticket_id: str,
+    contact_id: str,
+    amount_usd: float,
+    reason: str,
+    confirmed: bool = False,
+    tool_context: ToolContext | None = None,
 ) -> dict:
     """Issue an account credit to a contact against a ticket. The credit is
     created as "pending_review" for the billing team. Amounts above the
@@ -308,6 +382,10 @@ def issue_credit(
         "status": "pending_review", ...}, or a structured refusal/error dict
         with "detail".
     """
+    if not isinstance(confirmed, bool):
+        return _invalid("confirmed must be a boolean")
+    if isinstance(amount_usd, bool):
+        return _invalid("amount_usd must be a number")
     try:
         amount = float(amount_usd)  # 89 and 89.0 must fingerprint identically
     except (TypeError, ValueError):
@@ -316,12 +394,17 @@ def issue_credit(
         "ticket_id": ticket_id, "contact_id": contact_id, "amount_usd": amount, "reason": reason
     }
     return guard.guarded_write(
-        "issue_credit", payload, confirmed, lambda p: _client().create_credit(p)
+        "issue_credit", payload, confirmed, lambda p: _client().create_credit(p),
+        **_ctx(tool_context),
     )
 
 
 def escalate_ticket(
-    ticket_id: str, reason: str, priority: str = "high", confirmed: bool = False
+    ticket_id: str,
+    reason: str,
+    priority: str = "high",
+    confirmed: bool = False,
+    tool_context: ToolContext | None = None,
 ) -> dict:
     """Escalate a ticket to the on-call human lead: sets status "escalated"
     and records the reason. Use it FIRST, before any reply, for anything
@@ -344,15 +427,21 @@ def escalate_ticket(
         A preview dict, the escalated ticket {"status": "escalated", ...},
         or a structured error dict with "detail".
     """
+    if not isinstance(confirmed, bool):
+        return _invalid("confirmed must be a boolean")
     if priority not in ESCALATION_PRIORITIES:
         return _invalid('priority must be "high" or "emergency"')
+    ticket = get_ticket(ticket_id)
+    if ticket.get("error"):
+        return ticket
     payload = {"ticket_id": ticket_id, "reason": reason, "priority": priority}
 
     def perform(p: dict) -> dict:
         body = {"reason": p["reason"], "priority": p["priority"]}
         return _client().escalate_ticket(p["ticket_id"], body)
 
-    return guard.guarded_write("escalate_ticket", payload, confirmed, perform)
+    return guard.guarded_write("escalate_ticket", payload, confirmed, perform,
+                               **_ctx(tool_context))
 
 
 ALL_TOOLS = [

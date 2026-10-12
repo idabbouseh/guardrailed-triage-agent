@@ -310,6 +310,143 @@ def test_halted_agent_returns_halted_dict_and_writes_nothing(monkeypatch):
     assert _phases() == ["read", "preview", "halted", "halted"]
 
 
+# --- fix group 1: non-bool confirmed never performs a write ----------------
+
+
+@pytest.mark.parametrize("value", ["False", "false", "no", "0", 1, [False]], ids=repr)
+def test_non_boolean_confirmed_never_performs_a_write(value):
+    # Arrange: a live preview exists
+    tools.draft_reply("T-2003", REPLY_TEXT, "scheduling")
+
+    # Act: the model sends a non-bool where confirmed belongs
+    result = tools.draft_reply("T-2003", REPLY_TEXT, "scheduling", confirmed=value)
+
+    # Assert: only the literal True confirms
+    assert data.REPLIES == [], f"write performed with confirmed={value!r}: {result}"
+    assert "reply_id" not in result
+    assert "confirm" not in [r["phase"] for r in guard.read_audit()]
+
+
+# --- fix group 4: card detection with alternate separators -----------------
+
+
+@pytest.mark.parametrize("pan", [
+    "4111.1111.1111.1111",
+    "4111  1111 1111 1111",
+    "4111\t1111\t1111\t1111",
+    "4111_1111_1111_1111",
+])
+def test_card_number_is_masked_in_get_ticket_whatever_the_separator(pan):
+    # Arrange: inject a ticket whose body contains the PAN with a non-standard separator
+    base = next(t for t in data.TICKETS if t["ticket_id"] == "T-2012")
+    data.TICKETS.append({**base, "ticket_id": "T-7001", "body": f"Charge my Visa {pan} exp 09/28"})
+
+    body = tools.get_ticket("T-7001")["body"]
+
+    assert "4111" not in body and "****" in body, repr(body)
+    assert "4111" not in guard.redact(f"card {pan}")
+
+
+def test_dotted_card_in_draft_reply_is_refused_and_never_written():
+    pan = "4111.1111.1111.1111"
+    result = tools.draft_reply("T-2012", f"We charged {pan} as requested.", "billing")
+    assert result.get("refused") is True
+    # confirm should also be refused
+    result2 = tools.draft_reply("T-2012", f"We charged {pan} as requested.", "billing",
+                                 confirmed=True)
+    assert result2.get("refused") is True
+    assert data.REPLIES == []
+
+
+def test_cvv_is_masked_on_get_ticket_and_refused_on_draft_reply():
+    # T-2012 body contains "CVV 737"
+    body = tools.get_ticket("T-2012")["body"]
+    assert "737" not in body
+    result = tools.draft_reply("T-2012", "CVV 737 is your code.", "billing")
+    assert result.get("refused") is True
+
+
+# --- fix group 5: emergency override covers more phrasings -----------------
+
+
+GAS_CO_PHRASINGS = [
+    "it smells like gas in the basement by the furnace, what do I do",
+    "I keep smelling gas every time the furnace kicks on",
+    "I think the line is leaking gas behind the stove",
+    "I smell something weird in the basement by the furnace, like gas",
+    "our carbon-monoxide detector went off at 2am",
+    "propane leak near the water heater",
+    "smelled gas this morning",
+    "Hay un olor a gas muy fuerte en el sotano cerca de la caldera.",
+    "Huele a gas en la cocina desde ayer. Es peligroso?",
+    "Hay una fuga de gas en el calentador de agua",
+    "Sale humo del horno de la calefaccion",
+    "La alarma de monoxido de carbono se activo anoche",
+]
+
+
+@pytest.mark.parametrize("body", GAS_CO_PHRASINGS)
+def test_draft_reply_refuses_gas_or_co_report_whatever_the_phrasing(body):
+    # Arrange: a ticket the model would mislabel as scheduling
+    base = next(t for t in data.TICKETS if t["ticket_id"] == "T-2003")
+    data.TICKETS.append({**base, "ticket_id": "T-9001", "subject": "furnace question",
+                          "body": body})
+
+    result = tools.draft_reply("T-9001", "We can come out Thursday.", "scheduling")
+
+    assert result.get("refused") is True, result
+    assert "escalated to a human" in result["detail"]
+    assert data.REPLIES == []
+
+
+# --- fix group 8: tool input hygiene ---------------------------------------
+
+
+@pytest.mark.parametrize("ticket_id", ["", ".", "/"], ids=["empty", "dot", "slash"])
+def test_get_ticket_with_degenerate_id_is_an_error_not_the_listing(ticket_id):
+    result = tools.get_ticket(ticket_id)
+    assert result.get("error") is True
+    assert "tickets" not in result
+
+
+def test_empty_ticket_id_never_previews_and_find_duplicates_returns_error():
+    assert tools.draft_reply("", "Hello there", "scheduling").get("error") is True
+    assert tools.find_duplicates("").get("error") is True
+    assert "preview" not in [r["phase"] for r in guard.read_audit()]
+
+
+def test_escalate_ticket_unknown_id_is_a_404_not_a_preview():
+    result = tools.escalate_ticket("T-9099", "gas smell", priority="emergency")
+    assert result.get("error") is True and result.get("status_code") == 404
+    assert "preview" not in [r["phase"] for r in guard.read_audit()]
+
+
+def test_issue_credit_bool_amount_is_invalid_before_guard():
+    result = tools.issue_credit("T-2006", "C-1005", True, "bool amount")
+    assert result.get("invalid") is True or result.get("refused") is True
+    assert data.CREDITS == []
+    assert [r["phase"] for r in guard.read_audit()] == []
+
+
+def test_create_followup_task_rejects_non_yyyy_mm_dd_iso_forms():
+    for d in ("20261014", "2026-W42-3"):
+        result = tools.create_followup_task("T-2007", "manager", d, "n")
+        assert result.get("invalid") is True, f"expected invalid for due_date={d!r}, got {result}"
+
+
+# --- fix group 9: spam backstop --------------------------------------------
+
+
+def test_draft_reply_to_unlinked_vendor_ticket_refused_regardless_of_label():
+    # T-2008: contact_id=None, requester_email has no CRM record
+    result = tools.draft_reply("T-2008", "Yes, send the free audit!", "sales")
+    assert result.get("refused") is True
+    assert data.REPLIES == []
+
+
+# --- existing test (updated for audit trail) -------------------------------
+
+
 def test_audit_trail_records_every_decision_in_order(tools_env, monkeypatch):
     # Act: a representative session, including calls that never reach the guard
     tools.list_open_tickets()
@@ -337,6 +474,7 @@ def test_audit_trail_records_every_decision_in_order(tools_env, monkeypatch):
         ("issue_credit", "refused_policy"),
         ("get_ticket", "read"),
         ("draft_reply", "refused_policy"),
+        ("get_ticket", "read"),           # escalate_ticket pre-flight lookup
         ("escalate_ticket", "rejected_no_preview"),
         ("get_ticket", "halted"),
     ]

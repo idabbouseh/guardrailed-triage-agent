@@ -10,17 +10,17 @@ Built by Abe Dabbouseh, a 23-year enterprise integration consultant, as a refere
 
 ## The safety contract
 
-`triage_agent/guard.py` is the only path from a tool to the API. Its five guarantees, plus two refusals that fall under the fourth, are listed with the code that enforces each one and the test that proves it. Unqualified test names are in `tests/test_guard.py`. The suite has 109 tests across five files and runs without a model key: `pytest -q`.
+`triage_agent/guard.py` is the only path from a tool to the API. Its five guarantees, plus two refusals that fall under the fourth, are listed with the code that enforces each one and the test that proves it. Unqualified test names are in `tests/test_guard.py`. The suite has 179 tests across five files and runs without a model key: `pytest -q`.
 
 | # | Guarantee | Enforced in | Proven by |
 |---|---|---|---|
 | 1 | Read-only by default. A write tool called without `confirmed=True` returns a preview of the exact payload and performs nothing. | `guard.guarded_write` (unconfirmed branch), `PreviewRegistry.register` | `test_preview_performs_nothing_and_audits_preview`, `test_tools.py::test_draft_reply_preview_writes_nothing_and_audits_preview` |
-| 2 | Two-phase writes are enforced in code. A confirmed write runs only if the identical payload was previewed first, within the TTL, and each preview is consumed exactly once. Asserting approval does not skip the preview. | `guard.payload_fingerprint`, `PreviewRegistry.consume`, `guard.guarded_write` | `test_confirm_without_preview_is_rejected_and_performs_nothing`, `test_confirm_with_payload_different_from_preview_is_rejected`, `test_second_confirm_after_successful_write_is_rejected`, `test_expired_preview_is_rejected_after_ttl` |
+| 2 | Two-phase writes are enforced in code and scoped to the session. A confirmed write runs only if the identical payload was previewed first in the same session scope, within the TTL, and each preview is consumed exactly once; a confirm issued in the same invocation that created the preview is also rejected. Asserting approval does not skip the preview. | `guard.payload_fingerprint`, `PreviewRegistry.consume`, `guard.guarded_write` | `test_confirm_without_preview_is_rejected_and_performs_nothing`, `test_confirm_with_payload_different_from_preview_is_rejected`, `test_second_confirm_after_successful_write_is_rejected`, `test_expired_preview_is_rejected_after_ttl`, `test_confirm_from_different_scope_is_rejected`, `test_confirm_from_same_invocation_is_rejected`, `test_confirm_from_later_invocation_is_accepted` |
 | 3 | Kill switch on every call. `AGENT_HALT=1` or a `HALT` file in the repo root stops every read and write before it reaches the API. Nothing is cached, so it takes effect on the next call. | `guard.is_halted`, called first in `guarded_read` and `guarded_write` | `test_halted_write_never_calls_perform`, `test_halted_read_never_calls_perform`, `test_halted_by_halt_file_and_released_when_removed`, `test_tools.py::test_halted_agent_returns_halted_dict_and_writes_nothing` |
 | 4 | Policy caps survive approval. `MAX_CREDIT_USD` (150 by default) applies to every credit payload, including one the human has already approved. | `guard.check_policy` and `_credit_rule`, run before preview and again before confirm | `test_credit_over_cap_is_refused_even_when_previewed_and_confirmed`, `test_tools.py::test_issue_credit_over_cap_is_refused_before_any_preview` |
 | 4a | Categorical refusals. No reply is ever sent to a spam or emergency ticket. The emergency label comes from the ticket itself (status `escalated`, or life-safety words in its text), not from the model's classification. | `guard._reply_rule`, `tools._emergency_override` | `test_reply_to_spam_ticket_is_refused`, `test_reply_to_emergency_ticket_is_refused_whether_category_is_payload_or_context`, `test_tools.py::test_draft_reply_to_gas_smell_ticket_is_refused_whatever_the_model_says`, `test_tools.py::test_draft_reply_to_escalated_ticket_is_refused` |
-| 4b | Card numbers never reach the model or the API. Every read result is masked to `****` before it is returned, and a write payload containing a card-like number is refused. | `guard.redact` (called by all four read tools), `guard._contains_card` inside `check_policy` | `test_redact_masks_card_like_numbers_in_nested_values_without_mutating_input`, `test_card_like_number_is_refused_and_masked_in_audit`, `test_tools.py::test_list_open_tickets_masks_card_number_and_never_leaks_it` |
-| 5 | Every decision is audited. One JSON line per read, preview, confirm, rejection, refusal or halt, appended before the result is returned, with card numbers masked. | `guard.audit`, called from every branch of `guarded_read` and `guarded_write` | `test_audit_path_from_env_is_honored_and_lines_are_valid_json`, `test_confirm_audits_the_exception_when_perform_raises`, `test_tools.py::test_audit_trail_records_every_decision_in_order` |
+| 4b | Card numbers never reach the model or the API. Every read result is masked to `****` before it is returned, and a write payload containing a card-like number is refused. Non-digit separators including underscores are stripped before the Luhn check, so dotted, spaced, and underscore-formatted PANs are all caught. CVV/CVC patterns are masked independently of the Luhn check. | `guard.redact` (called by all four read tools), `guard._contains_card` inside `check_policy` | `test_redact_masks_card_like_numbers_in_nested_values_without_mutating_input`, `test_card_like_number_is_refused_and_masked_in_audit`, `test_card_number_with_non_standard_separator_is_masked_and_refused`, `test_cvv_value_is_masked_and_treated_as_card_like`, `test_tools.py::test_list_open_tickets_masks_card_number_and_never_leaks_it` |
+| 5 | Every decision is audited, and the audit is fail-closed. One JSON line per read, preview, confirm, rejection, refusal or halt is written before the result is returned, with card numbers masked. The audit line is written before a preview is registered and before a confirmed write is performed, so a write cannot happen without an audit record; if the audit line cannot be written, the preview or write is aborted. Read exceptions are audited before they are re-raised. | `guard.audit`, called from every branch of `guarded_read` and `guarded_write` | `test_audit_path_from_env_is_honored_and_lines_are_valid_json`, `test_confirm_audits_the_exception_when_perform_raises`, `test_preview_with_unwritable_audit_does_not_register`, `test_confirm_whose_audit_line_cannot_be_written_performs_nothing`, `test_read_audits_the_exception_when_perform_raises`, `test_tools.py::test_audit_trail_records_every_decision_in_order` |
 
 ## What the agent does
 
@@ -146,7 +146,7 @@ mock_helpdesk/data.py        30 seeded tickets and 12 contacts; the scenario map
 evals/cases.jsonl            30 labeled cases, one per seeded ticket
 evals/scorer.py              pure scoring functions, no I/O
 evals/run_evals.py           runs the agent over the cases against an in-process mock
-tests/                       109 tests: smoke, mock API, guard, tools, scorer and runner wiring
+tests/                       179 tests: smoke, mock API, guard, tools, scorer and runner wiring
 .github/workflows/tests.yml  pytest on every push and pull request, Python 3.12
 ```
 
@@ -185,7 +185,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env            # add GOOGLE_API_KEY; tests and --dry-run do not need it
-pytest -q                              # 109 passed
+pytest -q                              # 179 passed
 uvicorn mock_helpdesk.app:app --port 8086    # terminal 1
 adk web                                      # terminal 2, repo root; pick triage_agent
 ```

@@ -6,6 +6,9 @@ temporary audit file and a temporary HALT path, so nothing leaks between
 tests or touches the real repo root."""
 
 import json
+import os
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -474,3 +477,251 @@ def test_confirm_audits_the_exception_when_perform_raises():
     last = guard.read_audit()[-1]
     assert last["phase"] == "confirm"
     assert "RuntimeError" in last["result_summary"]
+
+
+# --- fix group 1: confirmed must be the literal bool True ------------------
+
+
+@pytest.mark.parametrize("value", ["false", "False", "no", "0", " ", 1, [False]])
+def test_confirmed_that_is_not_the_bool_true_takes_the_preview_path(value):
+    # Arrange: a live preview the human never approved
+    perform = Recorder()
+    guard.guarded_write("issue_credit", CREDIT, confirmed=False, perform=perform)
+
+    # Act: something truthy (or non-bool) that is not the literal True
+    result = guard.guarded_write("issue_credit", CREDIT, confirmed=value, perform=perform)
+
+    # Assert: only the literal True confirms; everything else re-previews
+    assert perform.calls == []
+    assert result.get("requires_confirmation") is True
+    assert "confirm" not in _phases()
+
+
+def test_guarded_write_performs_only_on_literal_bool_true():
+    # Arrange
+    perform = Recorder()
+    guard.guarded_write("issue_credit", CREDIT, confirmed=False, perform=perform)
+    guard.guarded_write("issue_credit", CREDIT, confirmed="False", perform=perform)
+
+    # Assert: two previews, no confirm
+    assert perform.calls == []
+    assert _phases() == ["preview", "preview"]
+
+
+# --- fix group 2: preview scoped to conversation and later invocation ------
+
+
+def test_confirm_from_different_scope_is_rejected():
+    # Arrange: preview issued in scope A
+    perform = Recorder()
+    guard.guarded_write("issue_credit", CREDIT, confirmed=False, perform=perform,
+                         scope="app/alice/session-A")
+
+    # Act: confirm attempted from scope B
+    result = guard.guarded_write("issue_credit", CREDIT, confirmed=True, perform=perform,
+                                  scope="app/bob/session-B")
+
+    # Assert: cross-scope confirm is rejected
+    assert result["error"] is True and "no matching preview" in result["detail"].lower()
+    assert perform.calls == []
+
+
+def test_confirm_from_same_invocation_is_rejected():
+    # Arrange: preview and confirm both in invocation inv-1 (self-approval)
+    perform = Recorder()
+    guard.guarded_write("issue_credit", CREDIT, confirmed=False, perform=perform,
+                         scope="app/user/sess", invocation_id="inv-1")
+
+    result = guard.guarded_write("issue_credit", CREDIT, confirmed=True, perform=perform,
+                                  scope="app/user/sess", invocation_id="inv-1")
+
+    assert result["error"] is True
+    assert perform.calls == []
+
+
+def test_confirm_from_later_invocation_is_accepted():
+    # Arrange: preview in inv-1, confirm in inv-2 (normal human-approval flow)
+    perform = Recorder()
+    guard.guarded_write("issue_credit", CREDIT, confirmed=False, perform=perform,
+                         scope="app/user/sess", invocation_id="inv-1")
+
+    result = guard.guarded_write("issue_credit", CREDIT, confirmed=True, perform=perform,
+                                  scope="app/user/sess", invocation_id="inv-2")
+
+    assert result.get("error") is not True
+    assert len(perform.calls) == 1
+
+
+# --- fix group 3: audit before side effects, fail closed -------------------
+
+
+def test_preview_with_unwritable_audit_does_not_register(monkeypatch, tmp_path):
+    # Arrange: the audit path is a directory (open 'a' raises)
+    bad = tmp_path / "audit_dir"
+    bad.mkdir()
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(bad))
+
+    # Act: the preview should raise (fail closed)
+    with pytest.raises(OSError):
+        guard.guarded_write("issue_credit", CREDIT, confirmed=False, perform=Recorder())
+
+    # Assert: no live preview was registered (audit failed before register)
+    live = guard.get_registry()._live()
+    assert live == {}
+
+
+def test_confirm_whose_audit_line_cannot_be_written_performs_nothing(monkeypatch, tmp_path):
+    # Arrange: healthy preview, then the audit path becomes a directory
+    perform = Recorder()
+    guard.guarded_write("issue_credit", CREDIT, confirmed=False, perform=perform)
+    bad = tmp_path / "now_a_dir"
+    bad.mkdir()
+    monkeypatch.setenv("AUDIT_LOG_PATH", str(bad))
+
+    # Act: audit open fails before perform is called
+    with pytest.raises(OSError):
+        guard.guarded_write("issue_credit", CREDIT, confirmed=True, perform=perform)
+
+    assert perform.calls == []
+
+
+def test_read_audits_the_exception_when_perform_raises():
+    # Arrange
+    def boom(_params: dict) -> dict:
+        raise RuntimeError("socket closed mid-request")
+
+    # Act / Assert: mirror of test_confirm_audits_the_exception_when_perform_raises
+    with pytest.raises(RuntimeError):
+        guard.guarded_read("get_ticket", {"ticket_id": "T-2003"}, boom)
+
+    records = guard.read_audit()
+    assert len(records) == 1
+    assert records[0]["tool"] == "get_ticket" and records[0]["phase"] == "read"
+    assert "RuntimeError" in records[0]["result_summary"]
+
+
+def test_audit_masks_card_in_result_summary():
+    # Arrange: a PAN inside a summary string (e.g. a get_contact 404 detail)
+    pan = "4111111111111111"
+    record = guard.audit("get_contact", "read", {"email": "x"},
+                         f"error: no contact with email {pan}")
+
+    # Assert: the PAN is masked in the stored record and in the file
+    assert "4111" not in record["result_summary"]
+    assert "****" in record["result_summary"]
+    raw = guard.audit_log_path().read_text(encoding="utf-8")
+    assert "4111" not in raw
+
+
+# --- fix group 4: card detection hardened ----------------------------------
+
+
+@pytest.mark.parametrize("pan", [
+    "4111.1111.1111.1111",
+    "4111  1111 1111 1111",
+    "4111\t1111\t1111\t1111",
+    "4111/1111/1111/1111",
+    "4111_1111_1111_1111",
+])
+def test_card_number_with_non_standard_separator_is_masked_and_refused(pan):
+    # redact
+    assert guard.redact(f"card {pan} please") == "card **** please"
+    # write policy
+    payload = {**REPLY, "body": f"card {pan}"}
+    assert guard.check_policy("draft_reply", payload) == guard.CARD_REASON
+    # audit redaction
+    record = guard.audit("draft_reply", "preview", payload, "t")
+    assert "4111" not in json.dumps(record["payload"])
+
+
+def test_cvv_value_is_masked_and_treated_as_card_like():
+    # A CVV near its label should be masked and refused
+    text = "exp 09/28, CVV 737. No receipt needed."
+    assert "737" not in guard.redact(text)
+    payload = {**REPLY, "body": text}
+    assert guard.check_policy("draft_reply", payload) == guard.CARD_REASON
+
+
+# --- fix group 6: config parsing fails closed ------------------------------
+
+
+@pytest.mark.parametrize("value", ["150abc", "inf", "1e999", "-1", "0"])
+def test_misconfigured_credit_cap_refuses_with_message_instead_of_raising(monkeypatch, value):
+    monkeypatch.setenv("MAX_CREDIT_USD", value)
+    perform = Recorder()
+
+    result = guard.guarded_write("issue_credit", CREDIT, confirmed=False, perform=perform)
+
+    assert result["refused"] is True and result["error"] is True
+    assert "misconfigured" in result["detail"].lower() or "disabled" in result["detail"].lower()
+    assert perform.calls == []
+    assert _phases() == ["refused_policy"]
+
+
+def test_misconfigured_ttl_falls_back_to_default(monkeypatch, guard_env):
+    # Arrange: TTL is not a valid float
+    monkeypatch.setenv("PREVIEW_TTL_SECONDS", "900s")
+    perform = Recorder()
+
+    # Act: preview should still work (falls back to default TTL)
+    result = guard.guarded_write("issue_credit", CREDIT, confirmed=False, perform=perform)
+
+    assert result["requires_confirmation"] is True
+    assert perform.calls == []
+
+
+# --- fix group 7: kill switch fails closed on stat errors ------------------
+
+
+def test_halt_file_that_cannot_be_stat_fails_closed(monkeypatch, guard_env):
+    # Arrange: stat() on the HALT path raises a non-ENOENT OS error
+    real_stat = os.stat
+
+    def denied(path, *args, **kwargs):
+        if os.fspath(path) == str(guard_env.halt_file):
+            raise PermissionError(13, "Access is denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", denied)
+
+    # Act / Assert: cannot determine state -> fail closed
+    assert guard.is_halted() is True
+
+
+# --- fix group 2 (TP-6): registry thread safety ----------------------------
+
+
+def test_consume_is_exactly_once_under_threads():
+    old_interval = time.get_clock_info  # noqa: F841 - just importing as anchor
+    import sys
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        reg = guard.PreviewRegistry(now=time.time)
+        for i in range(200):
+            reg.register("filler", {"i": i})
+        reg.register("issue_credit", {"k": "a"})
+        reg.register("issue_credit", {"k": "b"})
+
+        barrier = threading.Barrier(3)
+        results = []
+
+        def consume(payload):
+            barrier.wait()
+            ok = reg.consume("issue_credit", payload)
+            results.append((payload["k"], ok))
+
+        threads = [
+            threading.Thread(target=consume, args=({"k": "a"},)),
+            threading.Thread(target=consume, args=({"k": "a"},)),
+            threading.Thread(target=consume, args=({"k": "b"},)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        a_wins = sum(1 for k, ok in results if k == "a" and ok)
+        assert a_wins == 1, f"'a' consumed {a_wins} times (expected exactly 1)"
+    finally:
+        sys.setswitchinterval(old)

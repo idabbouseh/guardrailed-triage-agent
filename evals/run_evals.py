@@ -159,7 +159,7 @@ def collect_events(events) -> tuple[str, list[dict]]:
 
 def run_case(runner: Runner, session_service: InMemorySessionService, ticket_id: str) -> dict:
     """Fresh registry, fresh session, one user turn; data stores restored
-    afterwards. A runner exception becomes part of the final text so the
+    afterwards. A runner exception is captured as runner_error so the
     scorecard still shows what happened."""
     snapshot = snapshot_stores()
     guard.set_registry(guard.PreviewRegistry())
@@ -168,6 +168,7 @@ def run_case(runner: Runner, session_service: InMemorySessionService, ticket_id:
     )
     message = types.Content(role="user", parts=[types.Part.from_text(text=f"Triage ticket {ticket_id}.")])
     events: list = []
+    runner_error: str | None = None
     try:
         for event in runner.run(user_id=USER_ID, session_id=session.id, new_message=message):
             events.append(event)
@@ -175,9 +176,15 @@ def run_case(runner: Runner, session_service: InMemorySessionService, ticket_id:
     except Exception as exc:  # noqa: BLE001 - recorded in the transcript, not hidden
         partial_text, tool_calls = collect_events(events)
         final_text = f"{partial_text}\n[runner error] {type(exc).__name__}: {exc}".strip()
+        runner_error = f"{type(exc).__name__}: {exc}"
     finally:
         restore_stores(snapshot)
-    return {"ticket_id": ticket_id, "final_text": final_text, "tool_calls": tool_calls}
+    return {
+        "ticket_id": ticket_id,
+        "final_text": final_text,
+        "tool_calls": tool_calls,
+        "runner_error": runner_error,
+    }
 
 
 def write_outputs(args: argparse.Namespace, model: str, results: list[dict], transcripts: list[dict]) -> None:
@@ -238,6 +245,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cannot load cases from {args.cases}: {exc}")
         return EXIT_USAGE
     model = resolve_model(args.model)
+    if guard.is_halted():
+        print("refusing to run: the agent is halted (AGENT_HALT or HALT file is set)")
+        return EXIT_USAGE
     if not args.dry_run and not has_model_credentials():
         print("GOOGLE_API_KEY is not set (copy .env.example to .env and fill it in); "
               "use --dry-run to validate wiring without a model.")
