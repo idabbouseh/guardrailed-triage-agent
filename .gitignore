@@ -8,3 +8,4 @@ audit/*.jsonl
 evals/audit-*.jsonl
 evals/latest-results.json
 HALT
+evals/run-log.txt

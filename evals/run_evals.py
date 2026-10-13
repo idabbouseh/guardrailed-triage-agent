@@ -21,6 +21,7 @@ import copy
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,6 +50,8 @@ EXPECTED_TOOL_COUNT = 8
 STORES = ("CONTACTS", "TICKETS", "TASKS", "CREDITS", "REPLIES")
 TRUTHY = frozenset({"1", "true", "yes"})
 EXIT_OK, EXIT_USAGE, EXIT_NO_KEY = 0, 1, 2
+RATE_LIMIT_MARKERS = ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE")  # transient: quota or capacity
+RATE_LIMIT_BACKOFF_SECONDS = 65
 CASE_ENUMS = (("expected_category", scorer.CATEGORIES), ("expected_action", scorer.ACTIONS))
 
 
@@ -61,6 +64,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="scorecard markdown path")
     parser.add_argument("--json", type=Path, default=DEFAULT_JSON, help="raw results path")
     parser.add_argument("--dry-run", action="store_true", help="validate wiring, call no model")
+    parser.add_argument("--pause", type=float, default=0.0,
+                        help="seconds to wait between cases (free-tier keys allow ~15 requests/minute)")
+    parser.add_argument("--rate-limit-retries", type=int, default=2,
+                        help="re-run a case this many times if the model API returns a rate-limit or capacity error")
     return parser.parse_args(argv)
 
 
@@ -157,14 +164,16 @@ def collect_events(events) -> tuple[str, list[dict]]:
     return "\n".join(texts).strip(), tool_calls
 
 
-def run_case(runner: Runner, session_service: InMemorySessionService, ticket_id: str) -> dict:
+def run_case(runner: Runner, session_service: InMemorySessionService, ticket_id: str,
+             attempt: int = 0) -> dict:
     """Fresh registry, fresh session, one user turn; data stores restored
     afterwards. A runner exception is captured as runner_error so the
     scorecard still shows what happened."""
     snapshot = snapshot_stores()
     guard.set_registry(guard.PreviewRegistry())
+    suffix = f"-retry{attempt}" if attempt else ""
     session = session_service.create_session_sync(
-        app_name=APP_NAME, user_id=USER_ID, session_id=f"eval-{ticket_id}"
+        app_name=APP_NAME, user_id=USER_ID, session_id=f"eval-{ticket_id}{suffix}"
     )
     message = types.Content(role="user", parts=[types.Part.from_text(text=f"Triage ticket {ticket_id}.")])
     events: list = []
@@ -220,12 +229,33 @@ def dry_run(args: argparse.Namespace, cases: list[dict], model: str, client) -> 
     return EXIT_OK
 
 
+def is_rate_limited(transcript: dict) -> bool:
+    error = transcript.get("runner_error") or ""
+    return any(marker in error for marker in RATE_LIMIT_MARKERS)
+
+
+def run_case_with_retries(runner: Runner, session_service: InMemorySessionService,
+                          ticket_id: str, retries: int) -> dict:
+    """A rate-limit error says nothing about the agent, so the case is re-run
+    after a back-off instead of being scored as a runner failure."""
+    transcript = run_case(runner, session_service, ticket_id)
+    for attempt in range(1, retries + 1):
+        if not is_rate_limited(transcript):
+            break
+        print(f"{ticket_id}: rate limited, retrying in {RATE_LIMIT_BACKOFF_SECONDS}s", flush=True)
+        time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+        transcript = run_case(runner, session_service, ticket_id, attempt)
+    return transcript
+
+
 def run_all(args: argparse.Namespace, cases: list[dict], model: str) -> int:
     reset_audit_log()
     runner, session_service = build_runner(build_agent(model))
     results, transcripts = [], []
-    for case in cases:
-        transcript = run_case(runner, session_service, case["ticket_id"])
+    for index, case in enumerate(cases):
+        if index and args.pause:
+            time.sleep(args.pause)
+        transcript = run_case_with_retries(runner, session_service, case["ticket_id"], args.rate_limit_retries)
         result = scorer.score_case(case, transcript)
         results.append(result)
         transcripts.append(transcript)
