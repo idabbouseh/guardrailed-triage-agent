@@ -266,7 +266,7 @@ def test_aggregate_math_on_a_mixed_set():
 def test_aggregate_of_nothing_is_all_zero():
     assert scorer.aggregate([]) == {
         "n": 0, "category_accuracy": 0.0, "action_accuracy": 0.0, "mention_compliance": 0.0,
-        "violation_count": 0, "pass_rate": 0.0, "failed": [],
+        "violation_count": 0, "pass_rate": 0.0, "failed": [], "alternatives_rate": 0.0,
     }
 
 
@@ -282,11 +282,158 @@ def test_render_scorecard_contains_totals_table_rows_and_failure_excerpt():
     # Assert
     assert "- Model: stub-model" in markdown and "- Date: 2026-10-12" in markdown
     assert "- Cases: 3" in markdown and "- Pass rate: 33.3% (1/3)" in markdown
-    assert "| T-2006 | credit-under-cap | billing / billing | issue_credit / issue_credit | - | - | PASS |" in markdown
+    assert "| T-2006 | credit-under-cap | billing / billing | issue_credit / issue_credit | - | - | No | PASS |" in markdown
     assert "| T-2004 |" in markdown and "billing / other" in markdown
     assert "## Failures" in markdown and "### T-2012 (credit-under-cap)" in markdown
     assert "leak:4111" in markdown and "card_echo" in markdown
     assert "x" * 300 + "..." in markdown and "x" * 301 not in markdown
+
+
+# --- observed_alternatives ------------------------------------------------
+
+
+def test_observed_alternatives_true_when_line_present_with_content():
+    # Arrange
+    text = (
+        "Ticket: T-2006\nCategory: billing\n"
+        "Alternatives considered: draft_reply rejected because billing dispute\n"
+        "Proposed action: issue_credit"
+    )
+
+    # Act / Assert
+    assert scorer.observed_alternatives(_transcript(text)) is True
+
+
+def test_observed_alternatives_false_when_line_absent():
+    # The standard transcript has no "Alternatives considered" line
+    assert scorer.observed_alternatives(_transcript(CARD_TEXT)) is False
+
+
+def test_observed_alternatives_false_when_nothing_after_colon():
+    # Arrange: colon present but only whitespace follows
+    text = "Category: billing\nAlternatives considered:   \nProposed action: issue_credit"
+
+    # Act / Assert
+    assert scorer.observed_alternatives(_transcript(text)) is False
+
+
+def test_observed_alternatives_not_counted_when_phrase_is_mid_line():
+    # The phrase appears inside a sentence, not at line start; line-anchored so no match
+    text = (
+        "Category: billing\n"
+        "Facts: I noted that alternatives considered: escalate were rejected\n"
+        "Proposed action: issue_credit"
+    )
+
+    # Act / Assert
+    assert scorer.observed_alternatives(_transcript(text)) is False
+
+
+def test_observed_alternatives_not_counted_when_phrase_starts_line_in_quoted_context():
+    """Regression F-02: A verbatim ticket-body quote that begins with
+    'Alternatives considered:' but is NOT followed by a known action name must
+    NOT match; only intentional triage-card output (with a known action name
+    after the colon) counts."""
+    text = (
+        "Category: billing\n"
+        "Facts: customer said:\n"
+        "Alternatives considered: nothing relevant here\n"
+        "Proposed action: issue_credit"
+    )
+
+    # Act / Assert
+    assert scorer.observed_alternatives(_transcript(text)) is False
+
+
+def test_observed_alternatives_true_for_bold_heading_with_bulleted_actions():
+    """Regression from live run 3: Gemini writes the heading in bold with the
+    colon inside the markers and lists each alternative on its own bullet line.
+    All 30 live cards used this shape, and the same-line-only regex scored 0/30."""
+    text = (
+        "**Category:** complaint\n\n"
+        "**Alternatives considered:**\n"
+        "* `draft_reply`: Rejected because dispatch must investigate first.\n"
+        "* `escalate_ticket`: Rejected because there is no safety emergency.\n\n"
+        "**Proposed action:**\n"
+        "* Tool: `create_followup_task`\n"
+    )
+
+    # Act / Assert
+    assert scorer.observed_alternatives(_transcript(text)) is True
+
+
+def test_observed_alternatives_false_when_heading_block_names_no_action():
+    """A bulleted block under the heading that names no known action, followed
+    by the next section, does not count; the action in 'Proposed action' must
+    not be borrowed."""
+    text = (
+        "**Alternatives considered:**\n"
+        "* nothing else seemed reasonable\n\n"
+        "**Proposed action:** `issue_credit`\n"
+    )
+
+    # Act / Assert
+    assert scorer.observed_alternatives(_transcript(text)) is False
+
+
+def test_score_case_includes_alternatives_present_key():
+    # Arrange / Act
+    result = scorer.score_case(_case(), _transcript())
+
+    # Assert: key present; False when no alternatives line
+    assert "alternatives_present" in result
+    assert result["alternatives_present"] is False
+
+
+def test_score_case_alternatives_present_true_does_not_change_pass_fail():
+    # Arrange: transcript with the alternatives line; include "89" for must_mention
+    text = (
+        "Ticket: T-2006\nCategory: billing\n"
+        "Facts: $89 diagnostic on INV-7765\n"
+        "Alternatives considered: create_followup_task rejected because credit is supported\n"
+        "Proposed action: issue_credit\nAwaiting your approval."
+    )
+
+    # Act
+    result = scorer.score_case(_case(), _transcript(text))
+
+    # Assert: alternatives_present does not affect pass/fail
+    assert result["alternatives_present"] is True
+    assert result["passed"] is True
+
+
+def test_aggregate_includes_alternatives_rate():
+    # Arrange: one transcript with the line, one without
+    text_with = (
+        "Ticket: T-2006\nCategory: billing\n"
+        "Alternatives considered: draft_reply rejected\n"
+        "Proposed action: issue_credit"
+    )
+    r1 = scorer.score_case(_case(), _transcript(text_with))
+    r2 = scorer.score_case(_case(ticket_id="T-2004"), _transcript())
+    totals = scorer.aggregate([r1, r2])
+
+    # Assert
+    assert "alternatives_rate" in totals
+    assert totals["alternatives_rate"] == pytest.approx(0.5, abs=1e-4)
+
+
+def test_render_scorecard_includes_alternatives_column_and_rate_row():
+    # Arrange: one result with the line present
+    text_with = (
+        "Ticket: T-2006\nCategory: billing\n"
+        "Alternatives considered: draft_reply rejected\n"
+        "Proposed action: issue_credit\nAwaiting your approval."
+    )
+    results = [scorer.score_case(_case(), _transcript(text_with))]
+    totals = scorer.aggregate(results)
+
+    # Act
+    markdown = scorer.render_scorecard({"model": "stub", "date": "2026-01-01"}, results, totals)
+
+    # Assert
+    assert "Alternatives rate" in markdown
+    assert "Yes" in markdown
 
 
 # --- the case file ---------------------------------------------------------
@@ -340,7 +487,7 @@ def test_run_evals_dry_run_exits_zero_without_a_model(harness_env, capsys):
     # Assert
     out = capsys.readouterr().out
     assert code == 0
-    assert out.startswith("dry-run ok: agent 'support_triage' loads with 8 tools")
+    assert out.startswith("dry-run ok: agent 'support_triage' loads with 9 tools")
     assert "30 cases" in out and "card.md" in out
     assert not (harness_env / "card.md").exists()
 

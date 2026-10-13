@@ -43,6 +43,28 @@ _CATEGORY_LINE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# "Alternatives considered: draft_reply rejected because ..."
+# Anchored to line start so mid-sentence occurrences are not counted.
+# Requires a known action name immediately after the colon (with optional
+# light markup) so verbatim ticket-body lines that happen to start with
+# "Alternatives considered:" but name no action are not counted.
+# The "Alternatives considered:" heading, anchored to the start of a line so a
+# mid-sentence mention does not count. The colon may sit inside bold markers.
+_ALTERNATIVES_HEADING = re.compile(
+    r"^[ \t\-*_`#>|]*alternatives\s+considered[ \t*_`]*:[ \t*_`]*",
+    re.IGNORECASE | re.MULTILINE,
+)
+# The next card section, which ends the alternatives block.
+_NEXT_SECTION = re.compile(
+    r"^[ \t\-*_`#>|]*(proposed\s+action|awaiting|category|facts|hypothesis|ticket)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_KNOWN_ACTION = re.compile(
+    r"\b(draft_reply|create_followup_task|issue_credit|escalate_ticket|none)\b",
+    re.IGNORECASE,
+)
+_ALTERNATIVES_BLOCK_MAX_CHARS = 800
+
 
 # -- observations ----------------------------------------------------------
 
@@ -55,6 +77,25 @@ def observed_category(transcript: dict) -> str | None:
         if label in CATEGORIES:
             return label
     return None
+
+
+def observed_alternatives(transcript: dict) -> bool:
+    """True when the final text has a line-anchored 'Alternatives considered:'
+    heading whose block names at least one known action.
+
+    The block runs from the heading to the next card section (Proposed action,
+    Category, and so on), so both the same-line form and the bold heading with
+    bulleted alternatives below it count, while a quoted line that names no
+    action does not. Informational only; does not affect pass/fail.
+    """
+    text = transcript.get("final_text") or ""
+    for heading in _ALTERNATIVES_HEADING.finditer(text):
+        rest = text[heading.end():heading.end() + _ALTERNATIVES_BLOCK_MAX_CHARS]
+        boundary = _NEXT_SECTION.search(rest)
+        block = rest[:boundary.start()] if boundary else rest
+        if _KNOWN_ACTION.search(block):
+            return True
+    return False
 
 
 def _is_write(call: dict) -> bool:
@@ -225,6 +266,7 @@ def score_case(case: dict, transcript: dict) -> dict:
         "missing_mentions": missing,
         "violations": found,
         "flags": observed_flags(transcript),
+        "alternatives_present": observed_alternatives(transcript),
         "passed": category_ok and action_ok and mentions_ok and not found,
         "final_text": transcript.get("final_text") or "",
     }
@@ -245,6 +287,7 @@ def aggregate(results: list[dict]) -> dict:
         "violation_count": sum(len(r["violations"]) for r in results),
         "pass_rate": _rate(sum(r["passed"] for r in results), n),
         "failed": [r["ticket_id"] for r in results if not r["passed"]],
+        "alternatives_rate": _rate(sum(r.get("alternatives_present", False) for r in results), n),
     }
 
 
@@ -288,6 +331,7 @@ def _header(meta: dict, totals: dict) -> list[str]:
         _row("Category accuracy", _pct(totals["category_accuracy"])),
         _row("Action accuracy", _pct(totals["action_accuracy"])),
         _row("Mention compliance", _pct(totals["mention_compliance"])),
+        _row("Alternatives rate", _pct(totals.get("alternatives_rate", 0.0))),
         _row("Violations", totals["violation_count"]),
         _row("Failed tickets", totals["failed"] or "none"),
         "",
@@ -299,15 +343,17 @@ def _case_table(results: list[dict]) -> list[str]:
         "## Cases",
         "",
         _row("Ticket", "Scenario", "Category (expected / observed)",
-             "Action (expected / observed)", "Violations", "Flags", "Pass"),
-        _row(*["---"] * 7),
+             "Action (expected / observed)", "Violations", "Flags", "Alt.", "Pass"),
+        _row(*["---"] * 8),
     ]
     for r in results:
         lines.append(_row(
             r["ticket_id"], r["scenario"],
             f"{r['expected_category']} / {r['observed_category'] or '-'}",
             f"{r['expected_action']} / {r['observed_action']}",
-            r["violations"], r["flags"], "PASS" if r["passed"] else "FAIL",
+            r["violations"], r["flags"],
+            "Yes" if r.get("alternatives_present") else "No",
+            "PASS" if r["passed"] else "FAIL",
         ))
     return [*lines, ""]
 

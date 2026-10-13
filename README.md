@@ -10,7 +10,7 @@ Built by Abe Dabbouseh, a 23-year enterprise integration consultant, as a refere
 
 ## The safety contract
 
-`triage_agent/guard.py` is the only path from a tool to the API. Its five guarantees, plus two refusals that fall under the fourth, are listed with the code that enforces each one and the test that proves it. Unqualified test names are in `tests/test_guard.py`. The suite has 179 tests across five files and runs without a model key: `pytest -q`.
+`triage_agent/guard.py` is the only path from a tool to the API. Its five guarantees, plus two refusals that fall under the fourth, are listed with the code that enforces each one and the test that proves it. Unqualified test names are in `tests/test_guard.py`. The suite has 221 tests across seven files and runs without a model key: `pytest -q`.
 
 | # | Guarantee | Enforced in | Proven by |
 |---|---|---|---|
@@ -24,7 +24,7 @@ Built by Abe Dabbouseh, a 23-year enterprise integration consultant, as a refere
 
 ## What the agent does
 
-Eight tools. Reads pass through `guard.guarded_read` (kill switch, audit, card masking). Writes pass through `guard.guarded_write` (kill switch, policy check, preview or confirm against the registry, audit).
+Nine tools. Reads pass through `guard.guarded_read` (kill switch, audit, card masking). Writes pass through `guard.guarded_write` (kill switch, policy check, preview or confirm against the registry, audit). `record_human_decision` writes only to the audit log.
 
 | Tool | What it does | Guarded how |
 |---|---|---|
@@ -36,6 +36,7 @@ Eight tools. Reads pass through `guard.guarded_read` (kill switch, audit, card m
 | `create_followup_task(ticket_id, assignee, due_date, note)` | Opens an internal task for a person or queue (dispatch, billing, manager). | Write gate. `due_date` must be an ISO date. |
 | `issue_credit(ticket_id, contact_id, amount_usd, reason)` | Creates an account credit as `pending_review` for the billing team. | Write gate. `0 < amount_usd <= MAX_CREDIT_USD`; the mock API keeps its own 500 USD backstop. |
 | `escalate_ticket(ticket_id, reason, priority)` | Sets the ticket to `escalated` for the on-call lead. | Write gate. Non-empty reason; priority `high` or `emergency`. |
+| `record_human_decision(ticket_id, decision, reason, proposed_tool, edited_text)` | Records a human rejection or edit of a proposed action to the audit log. Never calls the helpdesk API or touches the preview registry. | Kill switch only. Card-like numbers in `reason` are masked before writing. |
 
 ### Triage procedure
 
@@ -53,6 +54,7 @@ Ticket: id, subject, requester, status
 Category: one of the nine
 Facts: bullet points taken from tool results only
 Hypothesis: the agent's reading of the situation, labelled as such
+Alternatives considered: one or two other actions weighed, each with the reason rejected
 Proposed action: the tool, its exact arguments, and the preview it returned
 Awaiting your approval.
 ```
@@ -138,15 +140,16 @@ flowchart LR
 
 ```
 triage_agent/agent.py        Agent definition and the operating contract the model is given
-triage_agent/tools.py        4 read tools, 4 write tools, emergency override, duplicate detection
+triage_agent/tools.py        4 read tools, 4 write tools, record_human_decision, emergency override, duplicate detection
 triage_agent/guard.py        kill switch, preview registry, policy rules, card redaction, audit log
 triage_agent/api_client.py   OAuth2 client_credentials client: token cache, one retry on 401
 mock_helpdesk/app.py         FastAPI helpdesk + CRM mock; POST creates only, no delete routes
 mock_helpdesk/data.py        30 seeded tickets and 12 contacts; the scenario map is in its docstring
 evals/cases.jsonl            30 labeled cases, one per seeded ticket
-evals/scorer.py              pure scoring functions, no I/O
+evals/scorer.py              pure scoring functions, no I/O; includes alternatives_rate metric
 evals/run_evals.py           runs the agent over the cases against an in-process mock
-tests/                       179 tests: smoke, mock API, guard, tools, scorer and runner wiring
+evals/harvest_feedback.py    converts human_rejected/human_edited audit lines into candidate cases
+tests/                       221 tests: smoke, mock API, guard, tools, feedback, scorer, harvest, runner
 .github/workflows/tests.yml  pytest on every push and pull request, Python 3.12
 ```
 
@@ -180,12 +183,35 @@ python -m evals.run_evals                            # full run, needs GOOGLE_AP
 | --- | --- | --- | --- | --- | --- | --- |
 | [Run 1, baseline](evals/scorecards/2026-10-13-gemini-3.8-flash-run1-baseline.md) | as first written | 23/30 (76.7%) | 80.0% | 96.7% | 1 | 0 |
 | [Run 2, tuned](evals/scorecards/2026-10-13-gemini-3.8-flash-run2-tuned.md) | category definitions and action rules added | 30/30 (100%) | 100% | 100% | 0 | 0 |
+| [Run 3, alternatives and feedback](evals/scorecards/2026-10-13-gemini-3.8-flash-run3-alternatives-feedback.md) | "Alternatives considered" line and `record_human_decision` added | 29/30 (96.7%) | 100% | 96.7% | 0 | 0 |
 
 What run 1 got wrong: five category disagreements where the action was still right (vendor pitches called "sales" instead of "spam", a contact-preference change called "scheduling"), an ambiguous one-liner turned into a task instead of a clarifying question, and one real judgment error: on an invoice dispute the agent previewed a $65 credit. It was under the cap, so policy did not block it, but the harness never approves, so nothing was written. Run 2 adds written definitions for the nine categories and three action rules (a billing dispute is a task for billing, not a credit; a contact-preference change gets a confirming reply; a vague message gets one clarifying question).
 
-Read run 2 with this caveat: the same 30 cases were used to tune the instruction and to score it, so it shows the fix on known cases, not performance on unseen tickets. A held-out set is the next step. In both runs every safety-critical case behaved: the gas-smell and CO-alarm tickets were escalated with no reply, the card number was never echoed, the over-cap refund was refused, and no write was ever confirmed without approval.
+Read run 2 with this caveat: the same 30 cases were used to tune the instruction and to score it, so it shows the fix on known cases, not performance on unseen tickets. A held-out set is the next step.
+
+Run 3 adds the "Alternatives considered" line to the triage card and the `record_human_decision` tool (see below). Every card listed the actions the agent weighed and rejected (30 of 30). One case regressed: on T-2030, a third missed appointment window, the agent proposed a dispatch task instead of escalating. Its own alternatives line shows why: it rejected escalation because there was "no life-safety emergency", although the instruction lists a customer without service after a missed window as an escalation. Nothing was written. This is the kind of reasoning error the alternatives line makes visible to the approver, who can reject it and have that rejection become a feedback case. The instruction was not tuned again on these same 30 cases.
+
+In all three runs every safety-critical case behaved: the gas-smell and CO-alarm tickets were escalated with no reply, the card number was never echoed, the over-cap refund was refused, and no write was ever confirmed without approval.
 
 Each run's scorecard is committed under `evals/scorecards/`; re-run with `python -m evals.run_evals --model <name> --pause 2` and commit the new scorecard with every model bump so the before and after can be compared. On a free-tier key, Flash models are limited to a small number of requests per day, so a full run needs a billed project (one run on Gemini 3.8 Flash costs about a dollar or two).
+
+## Learning from human feedback
+
+Two features let the agent's real-world decisions become future eval cases without using approvals as a training signal.
+
+**Why approvals are not used.** People rubber-stamp approvals, so a record of "human approved" carries no reliable learning signal. Rejections and edits are different: they represent an explicit correction, which is a meaningful signal about where the agent fell short.
+
+**What the agent records.** When the human rejects or edits a proposed action, the agent calls `record_human_decision` with the decision ("rejected" or "edited"), the rejected or edited tool, and the human's reason in their exact words. The call writes one line to the audit log with phase `human_rejected` or `human_edited`. Card-like numbers in the reason are masked before the line is written. The call never touches the helpdesk API, never modifies the preview registry, and is honoured by the kill switch.
+
+**Harvesting candidate cases.** After a session, run:
+
+```
+python -m evals.harvest_feedback [--audit evals/audit-latest.jsonl] [--out evals/feedback_cases.jsonl]
+```
+
+This reads the audit log, selects `human_rejected` and `human_edited` lines, and appends one candidate case per line to the output file. Rejected actions go into `forbidden_actions`; edited actions become the `expected_action` with up to three distinctive words from the edited text added to `must_mention`. Cases are de-duplicated by ticket, decision, and reason. Running the script again from the same audit file adds no duplicates.
+
+**What happens next.** Harvested cases carry `needs_labeling: true` and an empty `expected_category`. A human adds the category label and reviews the action mapping before the case joins the eval. The feedback file is kept separate from `evals/cases.jsonl` and mixed in only after labeling, making it a held-out set rather than a repeat of the tuning data.
 
 ## Run it locally
 
@@ -196,7 +222,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env            # add GOOGLE_API_KEY; tests and --dry-run do not need it
-pytest -q                              # 179 passed
+pytest -q                              # 221 passed
 uvicorn mock_helpdesk.app:app --port 8086    # terminal 1
 adk web                                      # terminal 2, repo root; pick triage_agent
 ```
