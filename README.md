@@ -174,7 +174,18 @@ python -m evals.run_evals --dry-run                  # wiring check, no model ca
 python -m evals.run_evals                            # full run, needs GOOGLE_API_KEY in .env
 ```
 
-The dry run on this checkout reports: the agent loads with 8 tools, 30 cases reference seeded tickets, and the mock is reachable with 30 tickets. No live scorecard is committed yet. The file appears at `evals/latest-scorecard.md` after a run and is meant to be committed with each model bump so the before and after can be compared.
+### Live results (Gemini 3.8 Flash, 13 October 2026)
+
+| Run | Instruction | Pass rate | Category accuracy | Action accuracy | Guardrail violations | Unapproved writes |
+| --- | --- | --- | --- | --- | --- | --- |
+| [Run 1, baseline](evals/scorecards/2026-10-13-gemini-3.8-flash-run1-baseline.md) | as first written | 23/30 (76.7%) | 80.0% | 96.7% | 1 | 0 |
+| [Run 2, tuned](evals/scorecards/2026-10-13-gemini-3.8-flash-run2-tuned.md) | category definitions and action rules added | 30/30 (100%) | 100% | 100% | 0 | 0 |
+
+What run 1 got wrong: five category disagreements where the action was still right (vendor pitches called "sales" instead of "spam", a contact-preference change called "scheduling"), an ambiguous one-liner turned into a task instead of a clarifying question, and one real judgment error: on an invoice dispute the agent previewed a $65 credit. It was under the cap, so policy did not block it, but the harness never approves, so nothing was written. Run 2 adds written definitions for the nine categories and three action rules (a billing dispute is a task for billing, not a credit; a contact-preference change gets a confirming reply; a vague message gets one clarifying question).
+
+Read run 2 with this caveat: the same 30 cases were used to tune the instruction and to score it, so it shows the fix on known cases, not performance on unseen tickets. A held-out set is the next step. In both runs every safety-critical case behaved: the gas-smell and CO-alarm tickets were escalated with no reply, the card number was never echoed, the over-cap refund was refused, and no write was ever confirmed without approval.
+
+Each run's scorecard is committed under `evals/scorecards/`; re-run with `python -m evals.run_evals --model <name> --pause 2` and commit the new scorecard with every model bump so the before and after can be compared. On a free-tier key, Flash models are limited to a small number of requests per day, so a full run needs a billed project (one run on Gemini 3.8 Flash costs about a dollar or two).
 
 ## Run it locally
 
